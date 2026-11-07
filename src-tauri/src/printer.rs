@@ -312,6 +312,207 @@ pub fn write_raw(_printer_name: &str, _bytes: &[u8], _document_name: &str) -> io
     ))
 }
 
+/// 描述: 通过 Windows 打印机驱动（GDI）输出 1bit 位图。
+/// 适用于 GP 等装了 Windows 驱动、RAW TSPL 会被当成文本狂打的机型。
+#[cfg(windows)]
+pub fn print_mono_gdi(
+    printer_name: &str,
+    width: u32,
+    height: u32,
+    mono: &[u8],
+    document_name: &str,
+    width_mm: f64,
+    height_mm: f64,
+) -> io::Result<usize> {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::ptr;
+
+    #[repr(C)]
+    struct DocInfoW {
+        cb_size: i32,
+        doc_name: *const u16,
+        output: *const u16,
+        datatype: *const u16,
+        fw_type: u32,
+    }
+
+    #[repr(C)]
+    struct BitmapInfoHeader {
+        size: u32,
+        width: i32,
+        height: i32,
+        planes: u16,
+        bit_count: u16,
+        compression: u32,
+        size_image: u32,
+        x_pels_per_meter: i32,
+        y_pels_per_meter: i32,
+        clr_used: u32,
+        clr_important: u32,
+    }
+
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn CreateDCW(
+            driver: *const u16,
+            device: *const u16,
+            port: *const u16,
+            init_data: *const c_void,
+        ) -> *mut c_void;
+        fn DeleteDC(hdc: *mut c_void) -> i32;
+        fn StartDocW(hdc: *mut c_void, doc_info: *const DocInfoW) -> i32;
+        fn EndDoc(hdc: *mut c_void) -> i32;
+        fn StartPage(hdc: *mut c_void) -> i32;
+        fn EndPage(hdc: *mut c_void) -> i32;
+        fn StretchDIBits(
+            hdc: *mut c_void,
+            x_dest: i32,
+            y_dest: i32,
+            dest_width: i32,
+            dest_height: i32,
+            x_src: i32,
+            y_src: i32,
+            src_width: i32,
+            src_height: i32,
+            bits: *const c_void,
+            bmi: *const BitmapInfoHeader,
+            usage: u32,
+            rop: u32,
+        ) -> i32;
+        fn GetDeviceCaps(hdc: *mut c_void, index: i32) -> i32;
+    }
+
+    const HORZRES: i32 = 8;
+    const VERTRES: i32 = 10;
+    const LOGPIXELSX: i32 = 88;
+    const LOGPIXELSY: i32 = 90;
+    const DIB_RGB_COLORS: u32 = 0;
+    const SRCCOPY: u32 = 0x00CC_0020;
+    const BI_RGB: u32 = 0;
+
+    let width_bytes = width.div_ceil(8) as usize;
+    let expected = width_bytes * height as usize;
+    if mono.len() < expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "位图数据长度不足",
+        ));
+    }
+
+    // 转 24bpp top-down DIB，行对齐 4 字节；1=黑
+    let stride = ((width as usize * 3 + 3) / 4) * 4;
+    let mut dib = vec![255u8; stride * height as usize];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let bit = (mono[y * width_bytes + x / 8] >> (7 - (x % 8))) & 1;
+            if bit == 1 {
+                let i = y * stride + x * 3;
+                dib[i] = 0;
+                dib[i + 1] = 0;
+                dib[i + 2] = 0;
+            }
+        }
+    }
+
+    let mut driver = "WINSPOOL\0".encode_utf16().collect::<Vec<u16>>();
+    let mut device = printer_name.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let mut doc_name = document_name.encode_utf16().chain([0]).collect::<Vec<u16>>();
+
+    unsafe {
+        let hdc = CreateDCW(
+            driver.as_mut_ptr(),
+            device.as_mut_ptr(),
+            ptr::null(),
+            ptr::null(),
+        );
+        if hdc.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let result = (|| {
+            let info = DocInfoW {
+                cb_size: size_of::<DocInfoW>() as i32,
+                doc_name: doc_name.as_mut_ptr(),
+                output: ptr::null(),
+                datatype: ptr::null(),
+                fw_type: 0,
+            };
+            if StartDocW(hdc, &info) <= 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if StartPage(hdc) <= 0 {
+                let _ = EndDoc(hdc);
+                return Err(io::Error::last_os_error());
+            }
+
+            let dpi_x = GetDeviceCaps(hdc, LOGPIXELSX).max(96) as f64;
+            let dpi_y = GetDeviceCaps(hdc, LOGPIXELSY).max(96) as f64;
+            let page_w = GetDeviceCaps(hdc, HORZRES).max(1);
+            let page_h = GetDeviceCaps(hdc, VERTRES).max(1);
+            let mut dest_w = ((width_mm.max(1.0) / 25.4) * dpi_x).round() as i32;
+            let mut dest_h = ((height_mm.max(1.0) / 25.4) * dpi_y).round() as i32;
+            dest_w = dest_w.clamp(1, page_w);
+            dest_h = dest_h.clamp(1, page_h);
+
+            let header = BitmapInfoHeader {
+                size: size_of::<BitmapInfoHeader>() as u32,
+                width: width as i32,
+                height: -(height as i32), // top-down
+                planes: 1,
+                bit_count: 24,
+                compression: BI_RGB,
+                size_image: dib.len() as u32,
+                x_pels_per_meter: 0,
+                y_pels_per_meter: 0,
+                clr_used: 0,
+                clr_important: 0,
+            };
+
+            let drawn = StretchDIBits(
+                hdc,
+                0,
+                0,
+                dest_w,
+                dest_h,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                dib.as_ptr() as *const c_void,
+                &header,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+            let page_ok = EndPage(hdc) > 0;
+            let doc_ok = EndDoc(hdc) > 0;
+            if drawn == 0 || !page_ok || !doc_ok {
+                return Err(io::Error::last_os_error());
+            }
+            Ok((dest_w * dest_h) as usize)
+        })();
+
+        DeleteDC(hdc);
+        result
+    }
+}
+
+#[cfg(not(windows))]
+pub fn print_mono_gdi(
+    _printer_name: &str,
+    _width: u32,
+    _height: u32,
+    _mono: &[u8],
+    _document_name: &str,
+    _width_mm: f64,
+    _height_mm: f64,
+) -> io::Result<usize> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "GDI 打印仅支持 Windows",
+    ))
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::list_printers;

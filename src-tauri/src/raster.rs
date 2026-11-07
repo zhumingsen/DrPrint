@@ -139,6 +139,10 @@ html, body {{
   height: {height_px}px !important;
   overflow: hidden !important;
   background: #ffffff !important;
+  /* 无头 Edge 必须显式指定中文字体，否则部分字形会落成方框/怪符号 */
+  font-family: "Microsoft YaHei", "PingFang SC", "SimHei", sans-serif !important;
+  -webkit-font-smoothing: none;
+  text-rendering: geometricPrecision;
 }}
 #hprint-zoom {{
   zoom: {zoom};
@@ -147,8 +151,9 @@ html, body {{
   transform-origin: top left;
   overflow: hidden;
 }}
-.hprint-paper {{
+.hprint-paper, .hprint-text, .hprint-keyvalue, .hprint-table {{
   margin: 0 !important;
+  font-family: "Microsoft YaHei", "PingFang SC", "SimHei", sans-serif !important;
 }}
 </style>
 </head>
@@ -192,11 +197,14 @@ fn rgba_to_mono(img: &image::RgbaImage, threshold: u8) -> MonoRaster {
 }
 
 /// 描述: HTML → 1bit 位图（Edge headless screenshot）
+///
+/// `target_width_dots` 优先使用打印机 printableWidthDots，避免位图宽于可打宽度导致换行乱码。
 pub fn html_to_mono_raster(
     html: &str,
     width_mm: f64,
     height_mm: f64,
     threshold: u8,
+    target_width_dots: Option<u32>,
 ) -> io::Result<MonoRaster> {
     let edge = find_edge().ok_or_else(|| {
         io::Error::new(
@@ -205,9 +213,16 @@ pub fn html_to_mono_raster(
         )
     })?;
 
-    // 标签机常见 203DPI；按纸张毫米换算目标点阵，保证打满标签
-    let width_px = ((width_mm * 203.0 / 25.4).round() as u32).max(8);
-    let height_px = ((height_mm * 203.0 / 25.4).round() as u32).max(8);
+    // 标签机常见 203DPI；宽度优先跟可打点阵对齐（必须是 8 的倍数）
+    let width_from_mm = ((width_mm * 203.0 / 25.4).round() as u32).max(8);
+    let mut width_px = target_width_dots.unwrap_or(width_from_mm).max(8);
+    width_px = width_px.next_multiple_of(8);
+    let height_px = if width_mm > 0.0 {
+        ((height_mm / width_mm) * width_px as f64).round() as u32
+    } else {
+        ((height_mm * 203.0 / 25.4).round() as u32).max(8)
+    }
+    .max(8);
     let (html_path, png_path) = temp_pair("job")?;
     let wrapped = wrap_html_for_raster(html, width_px, height_px);
     fs::write(&html_path, wrapped)?;

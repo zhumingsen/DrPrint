@@ -459,7 +459,7 @@ async fn process_job(state: AgentState, id: String) {
                     "raw-raster".to_string()
                 }
             });
-        let protocol = request
+        let mut protocol = request
             .raw_protocol
             .clone()
             .or_else(|| {
@@ -469,61 +469,109 @@ async fn process_job(state: AgentState, id: String) {
                     .map(ToOwned::to_owned)
             })
             .unwrap_or_else(|| infer_raw_protocol(&printer_name, &usage));
+        // GP Windows 驱动把 RAW 指令当文本狂打，强制走 GDI 位图
+        let printer_lower = printer_name.to_lowercase();
+        if printer_lower.contains("gp-") || printer_lower.starts_with("gp ") {
+            protocol = "gdi".to_string();
+        }
+        let use_gdi = protocol == "gdi" || protocol == "driver";
 
-        let payload = if render_mode == "webview" || usage == "document" {
+        if render_mode == "webview" || usage == "document" {
             // 文档链路暂仍走 RAW 文本；完整 WebView 静默打印后续补齐
-            Ok(html_to_text(&html).into_bytes())
-        } else if let Some(rasters) = request.rendered_rasters.as_ref().filter(|v| !v.is_empty()) {
-            build_raster_payload(rasters, &protocol, &request.template, &usage_settings)
+            let bytes = html_to_text(&html).into_bytes();
+            print_raw_copies(&printer_name, &bytes, &document_name, copies)
         } else {
-            // 兼容正式 SDK：只交 HTML，由 Agent 用 Edge 无头截图生成位图
-            let (paper_w, paper_h, _) = paper_mm(&request.template, &usage_settings);
-            let threshold = usage_settings
-                .pointer("/rasterCalibration/threshold")
-                .and_then(Value::as_u64)
-                .unwrap_or(160)
-                .clamp(1, 255) as u8;
-            match raster::html_to_mono_raster(&html, paper_w, paper_h, threshold) {
-                Ok(mono) => {
-                    let page = RasterPage {
-                        width: mono.width,
-                        height: mono.height,
-                        bytes_base64: BASE64.encode(&mono.bytes),
-                    };
-                    build_raster_payload(
-                        &[page],
+            let rasters_result: Result<Vec<RasterPage>, (String, String)> =
+                if let Some(rasters) = request.rendered_rasters.as_ref().filter(|v| !v.is_empty())
+                {
+                    Ok(rasters.clone())
+                } else {
+                    // 兼容正式 SDK：只交 HTML，由 Agent 用 Edge 无头截图生成位图
+                    let (paper_w, paper_h, _) = paper_mm(&request.template, &usage_settings);
+                    let threshold = usage_settings
+                        .pointer("/rasterCalibration/threshold")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(160)
+                        .clamp(1, 255) as u8;
+                    let target_width_dots = usage_settings
+                        .get("printableWidthDots")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as u32)
+                        .or_else(|| {
+                            usage_settings
+                                .get("printableWidthMm")
+                                .and_then(Value::as_f64)
+                                .map(|mm| ((mm * 203.0 / 25.4).round() as u32).max(8))
+                        });
+                    match raster::html_to_mono_raster(
+                        &html,
+                        paper_w,
+                        paper_h,
+                        threshold,
+                        target_width_dots,
+                    ) {
+                        Ok(mono) => Ok(vec![RasterPage {
+                            width: mono.width,
+                            height: mono.height,
+                            bytes_base64: BASE64.encode(&mono.bytes),
+                        }]),
+                        Err(e) => Err((
+                            "RASTER_RENDER_FAILED".to_string(),
+                            format!("HTML 转位图失败: {e}"),
+                        )),
+                    }
+                };
+
+            match rasters_result {
+                Ok(rasters) if use_gdi => {
+                    match prepare_gdi_pages(&rasters, &request.template, &usage_settings, &usage) {
+                        Ok(pages) => {
+                            let mut written = 0usize;
+                            let mut error = None;
+                            'outer: for _ in 0..copies {
+                                for (w, h, bits, mm_w, mm_h) in &pages {
+                                    match printer::print_mono_gdi(
+                                        &printer_name,
+                                        *w,
+                                        *h,
+                                        bits,
+                                        &document_name,
+                                        *mm_w,
+                                        *mm_h,
+                                    ) {
+                                        Ok(size) => written += size,
+                                        Err(e) => {
+                                            error = Some(e.to_string());
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(message) = error {
+                                Err(("PRINT_FAILED".to_string(), message, written))
+                            } else {
+                                Ok(written)
+                            }
+                        }
+                        Err((code, message)) => Err((code, message, 0usize)),
+                    }
+                }
+                Ok(rasters) => {
+                    match build_raster_payload(
+                        &rasters,
                         &protocol,
                         &request.template,
                         &usage_settings,
-                    )
-                }
-                Err(e) => Err((
-                    "RASTER_RENDER_FAILED".to_string(),
-                    format!("HTML 转位图失败: {e}"),
-                )),
-            }
-        };
-
-        match payload {
-            Ok(bytes) => {
-                let mut written = 0usize;
-                let mut error = None;
-                for _ in 0..copies {
-                    match printer::write_raw(&printer_name, &bytes, &document_name) {
-                        Ok(size) => written += size,
-                        Err(e) => {
-                            error = Some(e.to_string());
-                            break;
+                        &usage,
+                    ) {
+                        Ok(bytes) => {
+                            print_raw_copies(&printer_name, &bytes, &document_name, copies)
                         }
+                        Err((code, message)) => Err((code, message, 0usize)),
                     }
                 }
-                if let Some(message) = error {
-                    Err(("PRINT_FAILED".to_string(), message, written))
-                } else {
-                    Ok(written)
-                }
+                Err((code, message)) => Err((code, message, 0usize)),
             }
-            Err((code, message)) => Err((code, message, 0usize)),
         }
     };
     match result {
@@ -855,8 +903,11 @@ fn infer_raw_protocol(printer_name: &str, usage: &str) -> String {
     if usage == "document" {
         return "none".to_string();
     }
-    if lower.contains("gp-")
-        || lower.contains("tsc")
+    // GP 系列 Windows 驱动常把 RAW TSPL/位图当文本狂打出纸，走 GDI
+    if lower.contains("gp-") || lower.starts_with("gp ") {
+        return "gdi".to_string();
+    }
+    if lower.contains("tsc")
         || lower.contains("lpd")
         || lower.contains("bar code")
         || lower.contains("barcode")
@@ -872,10 +923,90 @@ fn infer_raw_protocol(printer_name: &str, usage: &str) -> String {
     }
 }
 
+fn print_raw_copies(
+    printer_name: &str,
+    bytes: &[u8],
+    document_name: &str,
+    copies: u32,
+) -> Result<usize, (String, String, usize)> {
+    let mut written = 0usize;
+    for _ in 0..copies {
+        match printer::write_raw(printer_name, bytes, document_name) {
+            Ok(size) => written += size,
+            Err(e) => return Err(("PRINT_FAILED".to_string(), e.to_string(), written)),
+        }
+    }
+    Ok(written)
+}
+
+/// 描述: 准备 GDI 打印页（裁白边/旋转；不反色，驱动按正常黑字输出）
+fn prepare_gdi_pages(
+    rasters: &[RasterPage],
+    template: &Value,
+    usage_settings: &Value,
+    usage: &str,
+) -> Result<Vec<(u32, u32, Vec<u8>, f64, f64)>, (String, String)> {
+    let (paper_w, paper_h, _) = paper_mm(template, usage_settings);
+    let mut pages = Vec::with_capacity(rasters.len());
+    for page in rasters {
+        let mono = BASE64.decode(page.bytes_base64.as_bytes()).map_err(|e| {
+            (
+                "RASTER_DECODE_FAILED".to_string(),
+                format!("位图 Base64 解码失败: {e}"),
+            )
+        })?;
+        let width_bytes = page.width.div_ceil(8);
+        let expected = width_bytes as usize * page.height as usize;
+        if mono.len() < expected {
+            return Err((
+                "RASTER_INVALID".to_string(),
+                format!(
+                    "位图字节不足：期望至少 {expected}，实际 {}",
+                    mono.len()
+                ),
+            ));
+        }
+        let (page_w, page_h, page_bits) =
+            crop_mono_trailing_white(page.width, page.height, &mono[..expected], 8);
+        let invert = usage_settings
+            .pointer("/rasterCalibration/invertMono")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let default_rotate = if usage == "label" { 180 } else { 0 };
+        let rotate = usage_settings
+            .pointer("/rasterCalibration/rotateDegrees")
+            .and_then(Value::as_u64)
+            .unwrap_or(default_rotate) as u32;
+        let (out_w, out_h, mut packed) = rotate_mono(page_w, page_h, &page_bits, rotate);
+        if invert {
+            for b in &mut packed {
+                *b = !*b;
+            }
+        }
+        let size_w = usage_settings
+            .get("printableWidthMm")
+            .and_then(Value::as_f64)
+            .unwrap_or(paper_w);
+        let size_h = ((out_h as f64) * 25.4 / 203.0).max(1.0).min(paper_h.max(1.0));
+        pages.push((out_w, out_h, packed, size_w, size_h));
+    }
+    Ok(pages)
+}
+
 fn paper_mm(template: &Value, usage_settings: &Value) -> (f64, f64, f64) {
-    let paper = usage_settings
-        .get("paper")
-        .or_else(|| template.get("paper"));
+    // 与打印机设置里的 paperPolicy 对齐：template / configFallback 优先模板尺寸
+    let policy = usage_settings
+        .get("paperPolicy")
+        .and_then(Value::as_str)
+        .unwrap_or("template");
+    let paper = match policy {
+        "configOverride" => usage_settings
+            .get("paper")
+            .or_else(|| template.get("paper")),
+        _ => template
+            .get("paper")
+            .or_else(|| usage_settings.get("paper")),
+    };
     let width = paper
         .and_then(|p| p.get("width"))
         .and_then(Value::as_f64)
@@ -896,6 +1027,7 @@ fn build_raster_payload(
     protocol: &str,
     template: &Value,
     usage_settings: &Value,
+    usage: &str,
 ) -> Result<Vec<u8>, (String, String)> {
     let (paper_w, paper_h, gap) = paper_mm(template, usage_settings);
     let mut out = Vec::new();
@@ -917,23 +1049,34 @@ fn build_raster_payload(
                 ),
             ));
         }
+        // 小票连续纸：裁掉底部大片空白，避免按配置纸高（如 200mm）整页出纸
+        let (page_w, page_h, page_bits) =
+            crop_mono_trailing_white(page.width, page.height, &mono[..expected], 8);
+        // TSPL/CPCL 与 ESC/POS 黑白极性相反；TSPL 默认反转，否则易黑底白字/发花
         let invert = usage_settings
             .pointer("/rasterCalibration/invertMono")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
-        // 标签机进纸方向常导致内容颠倒；默认旋转 180，可在 rasterCalibration.rotateDegrees 覆盖
+            .unwrap_or(protocol == "tspl" || protocol == "cpcl");
+        // 标签默认旋转 180；小票默认不转（可在 rotateDegrees 覆盖）
+        let default_rotate = if usage == "label" { 180 } else { 0 };
         let rotate = usage_settings
             .pointer("/rasterCalibration/rotateDegrees")
             .and_then(Value::as_u64)
-            .unwrap_or(180) as u32;
-        let (_out_w, out_h, mut packed) =
-            rotate_mono(page.width, page.height, &mono[..expected], rotate);
+            .unwrap_or(default_rotate) as u32;
+        let (out_w, out_h, mut packed) =
+            rotate_mono(page_w, page_h, &page_bits, rotate);
         if invert {
             for b in &mut packed {
                 *b = !*b;
             }
         }
-        let packed_width_bytes = _out_w.div_ceil(8);
+        let packed_width_bytes = out_w.div_ceil(8);
+        // SIZE 尽量贴合位图点阵，减少打印机自行拉伸造成的错位
+        let size_w = usage_settings
+            .get("printableWidthMm")
+            .and_then(Value::as_f64)
+            .unwrap_or(paper_w);
+        let size_h = ((out_h as f64) * 25.4 / 203.0).max(1.0).min(paper_h.max(1.0));
         match protocol {
             "escpos" => {
                 out.extend_from_slice(b"\x1b\x40");
@@ -946,8 +1089,8 @@ fn build_raster_payload(
             }
             "cpcl" => {
                 out.extend(build_tspl_page(
-                    paper_w,
-                    paper_h,
+                    size_w,
+                    size_h.max(paper_h.min(size_h + 2.0)),
                     gap,
                     packed_width_bytes,
                     out_h,
@@ -956,8 +1099,8 @@ fn build_raster_payload(
             }
             _ => {
                 out.extend(build_tspl_page(
-                    paper_w,
-                    paper_h,
+                    size_w,
+                    paper_h.max(size_h),
                     gap,
                     packed_width_bytes,
                     out_h,
@@ -980,8 +1123,10 @@ fn build_tspl_page(
     let mut out = Vec::with_capacity(mono.len() + 128);
     out.extend(format!("SIZE {paper_w:.2} mm,{paper_h:.2} mm\r\n").as_bytes());
     out.extend(format!("GAP {gap:.2} mm,0\r\n").as_bytes());
+    out.extend(b"DIRECTION 0\r\n");
+    out.extend(b"REFERENCE 0,0\r\n");
     out.extend(b"CLS\r\n");
-    // BITMAP x,y,width_bytes,height,mode,data — mode 0 覆盖
+    // BITMAP x,y,width_bytes,height,mode,data — mode 0 覆盖；高位在左
     out.extend(format!("BITMAP 0,0,{width_bytes},{height},0,").as_bytes());
     out.extend_from_slice(mono);
     out.extend(b"\r\nPRINT 1,1\r\n");
@@ -1003,6 +1148,30 @@ fn mono_set(dst: &mut [u8], width: u32, x: u32, y: u32) {
     if idx < dst.len() {
         dst[idx] |= 0x80 >> (x % 8);
     }
+}
+
+/// 描述: 裁掉底部全白行，保留少量 padding，避免小票按过大纸高空走过长
+fn crop_mono_trailing_white(
+    width: u32,
+    height: u32,
+    src: &[u8],
+    padding_rows: u32,
+) -> (u32, u32, Vec<u8>) {
+    let width_bytes = width.div_ceil(8) as usize;
+    let mut last_content = None;
+    for y in (0..height as usize).rev() {
+        let row = &src[y * width_bytes..(y + 1) * width_bytes];
+        if row.iter().any(|b| *b != 0) {
+            last_content = Some(y as u32);
+            break;
+        }
+    }
+    let Some(last) = last_content else {
+        return (width, height.min(8).max(1), src[..width_bytes].to_vec());
+    };
+    let new_h = (last + 1 + padding_rows).min(height).max(1);
+    let end = new_h as usize * width_bytes;
+    (width, new_h, src[..end].to_vec())
 }
 
 /// 描述: 1bit 位图旋转（0/90/180/270）
