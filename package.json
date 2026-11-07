@@ -9,7 +9,14 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "node scripts/run-tauri.mjs dev",
-    "tauri:build": "node scripts/run-tauri.mjs build"
+    "tauri:dev:win": "powershell -ExecutionPolicy Bypass -File ./scripts/dev.ps1",
+    "tauri:build": "node scripts/run-tauri.mjs build",
+    "icons": "node scripts/gen-icons.mjs",
+    "pack:win": "powershell -ExecutionPolicy Bypass -File ./scripts/build-windows.ps1",
+    "pack:mac": "bash ./scripts/build-macos.sh",
+    "pack:mac:arm": "bash ./scripts/build-macos.sh aarch64-apple-darwin",
+    "pack:mac:intel": "bash ./scripts/build-macos.sh x86_64-apple-darwin",
+    "pack:mac:universal": "bash ./scripts/build-macos.sh universal-apple-darwin"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

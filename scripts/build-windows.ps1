@@ -1,47 +1,58 @@
-# 描述: 在 Windows 上生成 HPrint Agent 发布版（exe + 安装包）
-# 用法: 在仓库 hiprint-v2 目录执行  powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
+# 描述: Windows 打安装包（MSI + NSIS setup.exe）
+# 用法:
+#   npm run pack:win
+#   powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
 
 $ErrorActionPreference = "Stop"
 if (-not $PSScriptRoot) {
   $PSScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
 $Root = Split-Path -Parent $PSScriptRoot
-if (-not $Root) {
-  Write-Error "无法定位项目根目录"
-}
+if (-not $Root) { Write-Error "无法定位项目根目录" }
 Set-Location $Root
 
-$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-$vcvars = $null
-if (Test-Path $vswhere) {
-  $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-  if ($vs) {
-    $candidate = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
-    if (Test-Path $candidate) { $vcvars = $candidate }
+function Find-VcVars64 {
+  $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+  if (Test-Path $vswhere) {
+    $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+    if ($vs) {
+      $candidate = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+      if (Test-Path $candidate) { return $candidate }
+    }
   }
+  $fallback = "F:\softDing\VSBuildTools\VC\Auxiliary\Build\vcvars64.bat"
+  if (Test-Path $fallback) { return $fallback }
+  return $null
 }
-if (-not $vcvars -and (Test-Path "F:\softDing\VSBuildTools\VC\Auxiliary\Build\vcvars64.bat")) {
-  $vcvars = "F:\softDing\VSBuildTools\VC\Auxiliary\Build\vcvars64.bat"
-}
+
+$vcvars = Find-VcVars64
 if (-not $vcvars) {
-  Write-Error "未找到 vcvars64.bat，请先安装 Visual Studio Build Tools (C++)"
+  Write-Error "未找到 vcvars64.bat，请安装 Visual Studio Build Tools (C++)"
 }
 
 Write-Host "使用 MSVC: $vcvars"
-# 只要安装包：MSI + NSIS（setup.exe）
+
+# 避免 exe 被占用导致 clean/link 失败
+Get-Process -Name "hiprint-v2" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
+
 $nsisWork = Join-Path $Root "src-tauri\target\release\nsis"
 $nsisOut = Join-Path $Root "src-tauri\target\release\bundle\nsis"
-if (Test-Path $nsisWork) { Remove-Item $nsisWork -Recurse -Force -ErrorAction SilentlyContinue }
-if (Test-Path $nsisOut) { Remove-Item $nsisOut -Recurse -Force -ErrorAction SilentlyContinue }
+if ($nsisWork -and (Test-Path $nsisWork)) {
+  Remove-Item $nsisWork -Recurse -Force -ErrorAction SilentlyContinue
+}
+if ($nsisOut -and (Test-Path $nsisOut)) {
+  Remove-Item $nsisOut -Recurse -Force -ErrorAction SilentlyContinue
+}
 
-Write-Host "开始打包安装包 (msi + nsis) ..."
+Write-Host "开始打包: MSI + NSIS ..."
 $cmd = "`"$vcvars`" && cd /d `"$Root`" && npx tauri build --bundles msi,nsis"
 cmd.exe /c $cmd
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host ""
-Write-Host "构建完成。安装包位置:"
-Write-Host "  MSI:  $Root\src-tauri\target\release\bundle\msi\"
-Write-Host "  NSIS: $Root\src-tauri\target\release\bundle\nsis\"
-Get-ChildItem "$Root\src-tauri\target\release\bundle\msi","$Root\src-tauri\target\release\bundle\nsis" -Recurse -File -ErrorAction SilentlyContinue |
+Write-Host "完成。安装包:"
+$msi = Join-Path $Root "src-tauri\target\release\bundle\msi"
+$nsis = Join-Path $Root "src-tauri\target\release\bundle\nsis"
+Get-ChildItem $msi, $nsis -Recurse -File -ErrorAction SilentlyContinue |
   Format-Table FullName, Length, LastWriteTime -AutoSize
