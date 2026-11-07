@@ -92,7 +92,8 @@ pub fn write_raw(printer_name: &str, bytes: &[u8], document_name: &str) -> io::R
         datatype: *mut u16,
     }
 
-    #[link(name = "winspool.drv")]
+    // 导入库是 winspool.lib（DLL 名为 winspool.drv）
+    #[link(name = "winspool")]
     unsafe extern "system" {
         fn OpenPrinterW(name: *mut u16, handle: *mut isize, defaults: *const c_void) -> i32;
         fn ClosePrinter(handle: isize) -> i32;

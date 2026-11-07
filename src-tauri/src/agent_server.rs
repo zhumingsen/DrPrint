@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post, put},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use crate::printer;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -335,8 +336,9 @@ async fn create_job(
     };
     state.jobs.write().await.insert(id.clone(), record);
     let worker_state = state.clone();
+    let job_id = id.clone();
     tokio::spawn(async move {
-        process_job(worker_state, id).await;
+        process_job(worker_state, job_id).await;
     });
     Ok(Json(json!({ "jobId": id, "status": "queued" })))
 }
@@ -406,12 +408,12 @@ async fn process_job(state: AgentState, id: String) {
         })
         .unwrap_or_else(|| template_to_html(&request.template, &request.data));
     let _ = fs::write(artifact_dir.join(format!("{id}.html")), &html);
-    let _ = fs::write(
-        artifact_dir.join(format!("{id}.json")),
-        serde_json::to_vec_pretty(
-            &json!({ "template": request.template.clone(), "data": request.data.clone() }),
-        ),
-    );
+    if let Ok(snapshot) = serde_json::to_vec_pretty(&json!({
+        "template": request.template.clone(),
+        "data": request.data.clone()
+    })) {
+        let _ = fs::write(artifact_dir.join(format!("{id}.json")), snapshot);
+    }
     let result = if printer_name.trim().is_empty() {
         Err(("NO_PRINTER".to_string(), "未配置打印机".to_string(), 0usize))
     } else {
