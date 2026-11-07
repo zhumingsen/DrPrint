@@ -474,6 +474,13 @@ async fn process_job(state: AgentState, id: String) {
         if printer_lower.contains("gp-") || printer_lower.starts_with("gp ") {
             protocol = "gdi".to_string();
         }
+        // macOS/Linux：位图统一走 CUPS（print_mono_gdi 内转 PNG + lp），避免 RAW 不可用
+        #[cfg(not(windows))]
+        {
+            if usage == "receipt" || usage == "label" {
+                protocol = "gdi".to_string();
+            }
+        }
         let use_gdi = protocol == "gdi" || protocol == "driver";
 
         if render_mode == "webview" || usage == "document" {

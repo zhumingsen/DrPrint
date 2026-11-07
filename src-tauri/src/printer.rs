@@ -232,7 +232,48 @@ Get-Printer |
 
 #[cfg(not(windows))]
 pub fn list_printers() -> Vec<SystemPrinter> {
-    Vec::new()
+    list_printers_cups()
+}
+
+/// 描述: macOS/Linux 通过 CUPS `lpstat` 枚举打印机
+#[cfg(not(windows))]
+fn list_printers_cups() -> Vec<SystemPrinter> {
+    use std::process::Command;
+
+    let Ok(output) = Command::new("lpstat").args(["-a"]).output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let default_name = Command::new("lpstat")
+        .args(["-d"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let text = String::from_utf8_lossy(&o.stdout);
+            text.split(':')
+                .nth(1)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let name = line.split_whitespace().next()?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let is_default = default_name.as_ref() == Some(&name);
+            Some(SystemPrinter {
+                name: name.clone(),
+                is_default,
+                status: "ready".to_string(),
+                driver_name: "CUPS".to_string(),
+                port_name: String::new(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(windows)]
@@ -505,20 +546,64 @@ pub fn print_mono_gdi(
     }
 }
 
+/// 描述: 非 Windows 将 1bit 位图转 PNG，经 CUPS `lp` 出纸（Mac 主路径）
 #[cfg(not(windows))]
 pub fn print_mono_gdi(
-    _printer_name: &str,
-    _width: u32,
-    _height: u32,
-    _mono: &[u8],
-    _document_name: &str,
+    printer_name: &str,
+    width: u32,
+    height: u32,
+    mono: &[u8],
+    document_name: &str,
     _width_mm: f64,
     _height_mm: f64,
 ) -> io::Result<usize> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "GDI 打印仅支持 Windows",
-    ))
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let width_bytes = width.div_ceil(8) as usize;
+    let expected = width_bytes * height as usize;
+    if mono.len() < expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "位图数据长度不足",
+        ));
+    }
+
+    let mut rgba = image::RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 255]));
+    for y in 0..height {
+        for x in 0..width {
+            let bit = (mono[(y as usize) * width_bytes + (x as usize) / 8] >> (7 - (x % 8))) & 1;
+            if bit == 1 {
+                rgba.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+            }
+        }
+    }
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("hprint-{stamp}.png"));
+    rgba.save(&path)
+        .map_err(|e| io::Error::other(format!("写 PNG 失败: {e}")))?;
+
+    let status = Command::new("lp")
+        .args([
+            "-d",
+            printer_name,
+            "-t",
+            document_name,
+            "-o",
+            "fit-to-page",
+            path.to_str().unwrap_or_default(),
+        ])
+        .status();
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(s) if s.success() => Ok((width * height) as usize),
+        Ok(s) => Err(io::Error::other(format!("lp 打印失败: exit={s}"))),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(all(test, windows))]

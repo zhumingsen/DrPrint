@@ -16,11 +16,27 @@ pub struct MonoRaster {
 }
 
 fn find_edge() -> Option<PathBuf> {
-    const CANDIDATES: &[&str] = &[
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ];
-    CANDIDATES.iter().map(PathBuf::from).find(|p| p.exists())
+    #[cfg(windows)]
+    {
+        const CANDIDATES: &[&str] = &[
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ];
+        return CANDIDATES.iter().map(PathBuf::from).find(|p| p.exists());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        const CANDIDATES: &[&str] = &[
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ];
+        return CANDIDATES.iter().map(PathBuf::from).find(|p| p.exists());
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        None
+    }
 }
 
 fn temp_pair(prefix: &str) -> io::Result<(PathBuf, PathBuf)> {
