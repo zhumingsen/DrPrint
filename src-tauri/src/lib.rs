@@ -2,7 +2,8 @@ mod agent_server;
 mod printer;
 
 use std::path::PathBuf;
-use std::sync::{atomic::AtomicU16, Arc};
+use std::sync::{Arc, atomic::AtomicU16};
+use tauri::Manager;
 
 pub struct AgentPort(pub Arc<AtomicU16>);
 
