@@ -158,6 +158,13 @@ export interface HPrintTemplate {
   designMode?: 'absolute' | 'receipt'
 }
 
+/** 客户端预渲染的单色位图页（raw-raster） */
+export interface HPrintRasterPage {
+  width: number
+  height: number
+  bytesBase64: string
+}
+
 /** 打印任务 */
 export interface HPrintPrintJob {
   template: HPrintTemplate
@@ -166,11 +173,14 @@ export interface HPrintPrintJob {
   renderedHtml?: string
   /** Client-rendered per-page HTML used by paged raw-raster printing. */
   renderedPages?: string[]
+  /** Client-rendered 1bit rasters for label/receipt raw printing. */
+  renderedRasters?: HPrintRasterPage[]
   printerName?: string
   copies?: number
   documentName?: string
   renderMode?: HPrintRenderMode
   usage?: HPrintPrintUsage
+  rawProtocol?: 'escpos' | 'tspl' | 'cpcl' | 'none'
 }
 
 /** 打印任务状态 */

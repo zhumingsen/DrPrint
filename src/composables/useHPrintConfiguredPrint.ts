@@ -17,6 +17,7 @@ export interface HPrintConfiguredPrintParams {
   copies?: number
   documentName?: string
   renderMode?: HPrintRenderMode
+  rawProtocol?: 'escpos' | 'tspl' | 'cpcl' | 'none'
 }
 
 export interface UseHPrintConfiguredPrintOptions extends AgentClientOptions {
@@ -58,15 +59,26 @@ export function useHPrintConfiguredPrint(options: UseHPrintConfiguredPrintOption
       const normalizedParams = {
         ...params,
         usage,
+        printerName: params.printerName || usageConfig?.printerName || undefined,
+        renderMode: params.renderMode || usageConfig?.renderMode || undefined,
+        rawProtocol: params.renderMode
+          ? undefined
+          : usageConfig?.rawProtocol || undefined,
       }
 
       if (settings.previewBeforePrint === true) {
-        pendingPrint.value = normalizedParams
+        pendingPrint.value = {
+          ...normalizedParams,
+          rawProtocol: usageConfig?.rawProtocol,
+        }
         showPreview.value = true
         return null
       }
 
-      return await submit(normalizedParams)
+      return await submit({
+        ...normalizedParams,
+        rawProtocol: usageConfig?.rawProtocol,
+      })
     } catch (err) {
       error.value = (err as Error).message
       throw err

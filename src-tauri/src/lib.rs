@@ -1,5 +1,6 @@
 mod agent_server;
 mod printer;
+mod raster;
 
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicU16};

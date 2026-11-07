@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post, put},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use crate::printer;
+use crate::{printer, raster};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -103,17 +103,27 @@ impl IntoResponse for ApiResponse {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RasterPage {
+    width: u32,
+    height: u32,
+    bytes_base64: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PrintJobRequest {
     template: Value,
     #[serde(default = "empty_object")]
     data: Value,
     rendered_html: Option<String>,
     rendered_pages: Option<Vec<String>>,
+    rendered_rasters: Option<Vec<RasterPage>>,
     printer_name: Option<String>,
     copies: Option<u32>,
     document_name: Option<String>,
     render_mode: Option<String>,
     usage: Option<String>,
+    raw_protocol: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -257,7 +267,16 @@ async fn printers(
     let items = printer::list_printers().into_iter().map(|item| {
         let lower = format!("{} {}", item.name, item.driver_name).to_lowercase();
         let document = lower.contains("pdf") || lower.contains("xps") || lower.contains("onenote") || lower.contains("document");
-        json!({ "name": item.name, "isDefault": item.is_default, "status": item.status, "printerType": if document { "document" } else { "raw" }, "capabilities": { "paperWidthMm": if document { 210 } else { 80 }, "charsPerLine": if document { 80 } else { 48 }, "encoding": "GBK", "dpi": 203, "printableWidthMm": if document { 210 } else { 72 }, "printableWidthDots": if document { 1680 } else { 576 }, "rawProtocol": if document { "none" } else { "escpos" }, "supportedModes": if document { json!(["webview"]) } else { json!(["raw", "raw-text", "raw-raster"]) } } })
+        {
+            let protocol = if document {
+                "none"
+            } else {
+                // 标签机默认 TSPL；小票类再走 ESC/POS
+                let p = infer_raw_protocol(&item.name, "label");
+                if p == "tspl" { "tspl" } else { "escpos" }
+            };
+            json!({ "name": item.name, "isDefault": item.is_default, "status": item.status, "printerType": if document { "document" } else { "raw" }, "capabilities": { "paperWidthMm": if document { 210 } else { 80 }, "charsPerLine": if document { 80 } else { 48 }, "encoding": "GBK", "dpi": 203, "printableWidthMm": if document { 210 } else { 72 }, "printableWidthDots": if document { 1680 } else { 576 }, "rawProtocol": protocol, "supportedModes": if document { json!(["webview"]) } else { json!(["raw", "raw-text", "raw-raster"]) } } })
+        }
     }).collect::<Vec<_>>();
     Ok(Json(Value::Array(items)))
 }
@@ -414,31 +433,97 @@ async fn process_job(state: AgentState, id: String) {
     })) {
         let _ = fs::write(artifact_dir.join(format!("{id}.json")), snapshot);
     }
+    let settings = state.settings.read().await.clone();
+    let usage_settings = settings
+        .get("printerSettings")
+        .and_then(|v| v.get(&usage))
+        .cloned()
+        .unwrap_or(Value::Null);
     let result = if printer_name.trim().is_empty() {
         Err(("NO_PRINTER".to_string(), "未配置打印机".to_string(), 0usize))
     } else {
         update_status(&state, &id, "printing", None, None, None).await;
-        let text = html_to_text(&html);
-        let bytes = if usage == "document" || request.render_mode.as_deref() == Some("webview") {
-            text.into_bytes()
+        let render_mode = request
+            .render_mode
+            .clone()
+            .or_else(|| {
+                usage_settings
+                    .get("renderMode")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| {
+                if usage == "document" {
+                    "webview".to_string()
+                } else {
+                    "raw-raster".to_string()
+                }
+            });
+        let protocol = request
+            .raw_protocol
+            .clone()
+            .or_else(|| {
+                usage_settings
+                    .get("rawProtocol")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| infer_raw_protocol(&printer_name, &usage));
+
+        let payload = if render_mode == "webview" || usage == "document" {
+            // 文档链路暂仍走 RAW 文本；完整 WebView 静默打印后续补齐
+            Ok(html_to_text(&html).into_bytes())
+        } else if let Some(rasters) = request.rendered_rasters.as_ref().filter(|v| !v.is_empty()) {
+            build_raster_payload(rasters, &protocol, &request.template, &usage_settings)
         } else {
-            escpos_text(&text)
+            // 兼容正式 SDK：只交 HTML，由 Agent 用 Edge 无头截图生成位图
+            let (paper_w, paper_h, _) = paper_mm(&request.template, &usage_settings);
+            let threshold = usage_settings
+                .pointer("/rasterCalibration/threshold")
+                .and_then(Value::as_u64)
+                .unwrap_or(160)
+                .clamp(1, 255) as u8;
+            match raster::html_to_mono_raster(&html, paper_w, paper_h, threshold) {
+                Ok(mono) => {
+                    let page = RasterPage {
+                        width: mono.width,
+                        height: mono.height,
+                        bytes_base64: BASE64.encode(&mono.bytes),
+                    };
+                    build_raster_payload(
+                        &[page],
+                        &protocol,
+                        &request.template,
+                        &usage_settings,
+                    )
+                }
+                Err(e) => Err((
+                    "RASTER_RENDER_FAILED".to_string(),
+                    format!("HTML 转位图失败: {e}"),
+                )),
+            }
         };
-        let mut written = 0usize;
-        let mut error = None;
-        for _ in 0..copies {
-            match printer::write_raw(&printer_name, &bytes, &document_name) {
-                Ok(size) => written += size,
-                Err(e) => {
-                    error = Some(e.to_string());
-                    break;
+
+        match payload {
+            Ok(bytes) => {
+                let mut written = 0usize;
+                let mut error = None;
+                for _ in 0..copies {
+                    match printer::write_raw(&printer_name, &bytes, &document_name) {
+                        Ok(size) => written += size,
+                        Err(e) => {
+                            error = Some(e.to_string());
+                            break;
+                        }
+                    }
+                }
+                if let Some(message) = error {
+                    Err(("PRINT_FAILED".to_string(), message, written))
+                } else {
+                    Ok(written)
                 }
             }
-        }
-        if let Some(message) = error {
-            Err(("PRINT_FAILED".to_string(), message, written))
-        } else {
-            Ok(written)
+            Err((code, message)) => Err((code, message, 0usize)),
         }
     };
     match result {
@@ -763,6 +848,130 @@ fn escpos_text(text: &str) -> Vec<u8> {
     bytes.extend_from_slice(b"\n\n");
     bytes.extend_from_slice(b"\x1d\x56\x00");
     bytes
+}
+
+fn infer_raw_protocol(printer_name: &str, usage: &str) -> String {
+    let lower = printer_name.to_lowercase();
+    if usage == "document" {
+        return "none".to_string();
+    }
+    if lower.contains("gp-")
+        || lower.contains("tsc")
+        || lower.contains("lpd")
+        || lower.contains("bar code")
+        || lower.contains("barcode")
+        || lower.contains("zebra")
+        || lower.contains("godex")
+        || lower.contains("label")
+    {
+        "tspl".to_string()
+    } else if usage == "receipt" {
+        "escpos".to_string()
+    } else {
+        "tspl".to_string()
+    }
+}
+
+fn paper_mm(template: &Value, usage_settings: &Value) -> (f64, f64, f64) {
+    let paper = usage_settings
+        .get("paper")
+        .or_else(|| template.get("paper"));
+    let width = paper
+        .and_then(|p| p.get("width"))
+        .and_then(Value::as_f64)
+        .unwrap_or(80.0);
+    let height = paper
+        .and_then(|p| p.get("height"))
+        .and_then(Value::as_f64)
+        .unwrap_or(60.0);
+    let gap = usage_settings
+        .get("gapMm")
+        .and_then(Value::as_f64)
+        .unwrap_or(2.0);
+    (width, height, gap)
+}
+
+fn build_raster_payload(
+    rasters: &[RasterPage],
+    protocol: &str,
+    template: &Value,
+    usage_settings: &Value,
+) -> Result<Vec<u8>, (String, String)> {
+    let (paper_w, paper_h, gap) = paper_mm(template, usage_settings);
+    let mut out = Vec::new();
+    for page in rasters {
+        let mono = BASE64.decode(page.bytes_base64.as_bytes()).map_err(|e| {
+            (
+                "RASTER_DECODE_FAILED".to_string(),
+                format!("位图 Base64 解码失败: {e}"),
+            )
+        })?;
+        let width_bytes = page.width.div_ceil(8);
+        let expected = width_bytes as usize * page.height as usize;
+        if mono.len() < expected {
+            return Err((
+                "RASTER_INVALID".to_string(),
+                format!(
+                    "位图字节不足：期望至少 {expected}，实际 {}",
+                    mono.len()
+                ),
+            ));
+        }
+        let mut bits = mono[..expected].to_vec();
+        let invert = usage_settings
+            .pointer("/rasterCalibration/invertMono")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if invert {
+            for b in &mut bits {
+                *b = !*b;
+            }
+        }
+        match protocol {
+            "escpos" => {
+                out.extend_from_slice(b"\x1b\x40");
+                // GS v 0：光栅位图
+                out.extend_from_slice(&[0x1d, 0x76, 0x30, 0x00]);
+                out.extend_from_slice(&(width_bytes as u16).to_le_bytes());
+                out.extend_from_slice(&(page.height as u16).to_le_bytes());
+                out.extend_from_slice(&bits);
+                out.extend_from_slice(b"\n\n\x1d\x56\x00");
+            }
+            "cpcl" => {
+                out.extend(build_tspl_page(paper_w, paper_h, gap, width_bytes, page.height, &bits));
+            }
+            _ => {
+                out.extend(build_tspl_page(
+                    paper_w,
+                    paper_h,
+                    gap,
+                    width_bytes,
+                    page.height,
+                    &bits,
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn build_tspl_page(
+    paper_w: f64,
+    paper_h: f64,
+    gap: f64,
+    width_bytes: u32,
+    height: u32,
+    mono: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(mono.len() + 128);
+    out.extend(format!("SIZE {paper_w:.2} mm,{paper_h:.2} mm\r\n").as_bytes());
+    out.extend(format!("GAP {gap:.2} mm,0\r\n").as_bytes());
+    out.extend(b"CLS\r\n");
+    // BITMAP x,y,width_bytes,height,mode,data — mode 0 覆盖
+    out.extend(format!("BITMAP 0,0,{width_bytes},{height},0,").as_bytes());
+    out.extend_from_slice(mono);
+    out.extend(b"\r\nPRINT 1,1\r\n");
+    out
 }
 fn minimal_pdf(text: &str) -> Vec<u8> {
     let safe = text.replace('(', "[").replace(')', "]").replace('\n', " ");

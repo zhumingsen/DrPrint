@@ -21,6 +21,8 @@ import type {
   HPrintHistoryListResponse,
 } from '../core/types'
 import { buildPagedHtml } from '../core/exportArtifacts'
+import { htmlToMonoRaster } from '../core/rasterEncode'
+import { inferPrintUsage } from '../core/printUsage'
 import { renderTemplateToHtml, renderTemplateToPages } from '../core/visualRenderer'
 
 export interface AgentClientOptions {
@@ -199,29 +201,75 @@ export function createAgentClient(options: AgentClientOptions = {}) {
       documentName?: string
       renderMode?: HPrintRenderMode
       usage?: HPrintPrintUsage
+      rawProtocol?: 'escpos' | 'tspl' | 'cpcl' | 'none'
     }): Promise<PrintJobResponse> {
       const data = params.data || {}
-      const template = normalizePrintTemplate(params.template, params.usage)
+      const usage = params.usage || inferPrintUsage(params.template)
+      let renderMode = params.renderMode
+      let rawProtocol = params.rawProtocol
+      let printerName = params.printerName
+
+      // 未显式指定时，从 Agent 打印机设置补齐标签/小票的 raw-raster 参数
+      if (!renderMode || !printerName || !rawProtocol) {
+        try {
+          const settings = await this.getPrinterSettings()
+          const usageConfig = settings.printerSettings?.[usage]
+          renderMode = renderMode || usageConfig?.renderMode || (usage === 'document' ? 'webview' : 'raw-raster')
+          printerName = printerName || usageConfig?.printerName || undefined
+          rawProtocol = rawProtocol || usageConfig?.rawProtocol || undefined
+        } catch {
+          renderMode = renderMode || (usage === 'document' ? 'webview' : 'raw-raster')
+        }
+      }
+
+      const template = normalizePrintTemplate(params.template, usage)
+      const paperWidthMm = template.paper?.width || 80
+      const paperHeightMm = template.paper?.height || 60
+      const isRawRaster = renderMode === 'raw-raster' || renderMode === 'raw' || renderMode === 'raw-text'
+      // 标签机通常 203dpi；文档仍按屏幕 DPI 渲染 HTML
+      const mmToPx = isRawRaster ? 203 / 25.4 : undefined
       const rawPagination = template.printOptions?.rawPagination || 'continuous'
-      const pagedRenderResult = rawPagination === 'paged'
-        ? renderTemplateToPages(template, data)
+      const pagedRenderResult = (rawPagination === 'paged' || isRawRaster)
+        ? renderTemplateToPages(template, data, mmToPx ? { mmToPx } : {})
         : null
-      const usePagedHtml = params.renderMode === 'webview' || params.usage === 'document'
+      const usePagedHtml = renderMode === 'webview' || usage === 'document'
       const renderedHtml = usePagedHtml
         ? buildPagedHtml(pagedRenderResult || renderTemplateToPages(template, data))
         : pagedRenderResult?.pages[0]?.html
-          || renderTemplateToHtml(template, data).html
+          || renderTemplateToHtml(template, data, mmToPx ? { mmToPx } : {}).html
       const renderedPages = pagedRenderResult?.pages.map((page) => page.html)
+
+      let renderedRasters: HPrintPrintJob['renderedRasters']
+      if (isRawRaster) {
+        const pages = pagedRenderResult?.pages?.length
+          ? pagedRenderResult.pages
+          : [{
+              html: renderedHtml,
+              widthPx: paperWidthMm * (mmToPx || 3.7795),
+              heightPx: paperHeightMm * (mmToPx || 3.7795),
+            }]
+        renderedRasters = []
+        for (const page of pages) {
+          renderedRasters.push(await htmlToMonoRaster(page.html, page.widthPx, page.heightPx))
+        }
+        if (!rawProtocol || rawProtocol === 'none') {
+          const name = (printerName || '').toLowerCase()
+          rawProtocol = /gp-|tsc|lpd|bar\s*code|label|zebra|godex/.test(name) ? 'tspl' : 'escpos'
+        }
+      }
+
       const job: HPrintPrintJob = {
         template,
         data,
         renderedHtml,
         renderedPages,
-        printerName: params.printerName,
+        renderedRasters,
+        printerName,
         copies: params.copies,
         documentName: params.documentName,
-        renderMode: params.renderMode,
-        usage: params.usage,
+        renderMode,
+        usage,
+        rawProtocol,
       }
 
       const result = await request<PrintJobResponse>('/print-jobs', {
@@ -253,6 +301,7 @@ export function createAgentClient(options: AgentClientOptions = {}) {
       documentName?: string
       renderMode?: HPrintRenderMode
       usage?: HPrintPrintUsage
+      rawProtocol?: 'escpos' | 'tspl' | 'cpcl' | 'none'
     }): Promise<HPrintJobDetail> {
       // 1. 提交任务（使用 HTTP 超时）
       const result = await this.print(params)
