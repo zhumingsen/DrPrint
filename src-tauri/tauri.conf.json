@@ -13,8 +13,11 @@
     "windows": [
       {
         "title": "HPrint Agent",
-        "width": 800,
-        "height": 600
+        "width": 1180,
+        "height": 820,
+        "minWidth": 960,
+        "minHeight": 680,
+        "decorations": false
       }
     ],
     "security": {

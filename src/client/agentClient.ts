@@ -78,10 +78,11 @@ export interface JobArtifactsResponse {
 export async function discoverAgentUrl(explicitUrl?: string): Promise<string> {
   if (explicitUrl) return explicitUrl
 
-  // Tauri 环境：通过 IPC 获取实际端口
-  if (typeof window !== 'undefined' && (window as any).__TAURI__) {
+  // Tauri 2：通过 IPC 获取实际端口
+  if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
     try {
-      const port = await (window as any).__TAURI__.core.invoke('get_agent_port')
+      const { invoke } = await import('@tauri-apps/api/core')
+      const port = await invoke<number>('get_agent_port')
       if (port && typeof port === 'number') {
         return `http://127.0.0.1:${port}`
       }

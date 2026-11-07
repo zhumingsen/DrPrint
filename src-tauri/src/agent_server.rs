@@ -245,7 +245,7 @@ async fn health(
 ) -> Result<Json<Value>, ApiResponse> {
     authorize(&headers, &state)?;
     Ok(Json(
-        json!({ "ok": true, "name": "HPrint Agent", "version": "1.0.0-reconstructed", "protocolVersion": "2026-06" }),
+        json!({ "ok": true, "name": "HPrint Agent", "version": "1.0.0", "protocolVersion": "2026-06" }),
     ))
 }
 
@@ -677,7 +677,7 @@ async fn diagnostics(
     let printers = printer::list_printers();
     let jobs = state.jobs.read().await;
     Ok(Json(
-        json!({ "agent": { "version": "1.0.0-reconstructed", "protocolVersion": "2026-06" }, "system": { "platform": std::env::consts::OS, "arch": std::env::consts::ARCH }, "printers": { "count": printers.len(), "defaultPrinter": printers.iter().find(|p| p.is_default).map(|p| p.name.clone()) }, "jobs": { "total": jobs.len(), "queued": jobs.values().filter(|j| j.status == "queued").count(), "printing": jobs.values().filter(|j| j.status == "printing").count(), "printed": jobs.values().filter(|j| j.status == "printed").count(), "failed": jobs.values().filter(|j| j.status == "failed").count() }, "uptimeSeconds": state.started_at.elapsed().as_secs() }),
+        json!({ "agent": { "version": "1.0.0", "protocolVersion": "2026-06" }, "system": { "platform": std::env::consts::OS, "arch": std::env::consts::ARCH }, "printers": { "count": printers.len(), "defaultPrinter": printers.iter().find(|p| p.is_default).map(|p| p.name.clone()) }, "jobs": { "total": jobs.len(), "queued": jobs.values().filter(|j| j.status == "queued").count(), "printing": jobs.values().filter(|j| j.status == "printing").count(), "printed": jobs.values().filter(|j| j.status == "printed").count(), "failed": jobs.values().filter(|j| j.status == "failed").count() }, "uptimeSeconds": state.started_at.elapsed().as_secs() }),
     ))
 }
 async fn auth_config(
