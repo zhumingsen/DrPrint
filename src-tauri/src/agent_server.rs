@@ -917,37 +917,51 @@ fn build_raster_payload(
                 ),
             ));
         }
-        let mut bits = mono[..expected].to_vec();
         let invert = usage_settings
             .pointer("/rasterCalibration/invertMono")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // 标签机进纸方向常导致内容颠倒；默认旋转 180，可在 rasterCalibration.rotateDegrees 覆盖
+        let rotate = usage_settings
+            .pointer("/rasterCalibration/rotateDegrees")
+            .and_then(Value::as_u64)
+            .unwrap_or(180) as u32;
+        let (_out_w, out_h, mut packed) =
+            rotate_mono(page.width, page.height, &mono[..expected], rotate);
         if invert {
-            for b in &mut bits {
+            for b in &mut packed {
                 *b = !*b;
             }
         }
+        let packed_width_bytes = _out_w.div_ceil(8);
         match protocol {
             "escpos" => {
                 out.extend_from_slice(b"\x1b\x40");
                 // GS v 0：光栅位图
                 out.extend_from_slice(&[0x1d, 0x76, 0x30, 0x00]);
-                out.extend_from_slice(&(width_bytes as u16).to_le_bytes());
-                out.extend_from_slice(&(page.height as u16).to_le_bytes());
-                out.extend_from_slice(&bits);
+                out.extend_from_slice(&(packed_width_bytes as u16).to_le_bytes());
+                out.extend_from_slice(&(out_h as u16).to_le_bytes());
+                out.extend_from_slice(&packed);
                 out.extend_from_slice(b"\n\n\x1d\x56\x00");
             }
             "cpcl" => {
-                out.extend(build_tspl_page(paper_w, paper_h, gap, width_bytes, page.height, &bits));
+                out.extend(build_tspl_page(
+                    paper_w,
+                    paper_h,
+                    gap,
+                    packed_width_bytes,
+                    out_h,
+                    &packed,
+                ));
             }
             _ => {
                 out.extend(build_tspl_page(
                     paper_w,
                     paper_h,
                     gap,
-                    width_bytes,
-                    page.height,
-                    &bits,
+                    packed_width_bytes,
+                    out_h,
+                    &packed,
                 ));
             }
         }
@@ -972,6 +986,63 @@ fn build_tspl_page(
     out.extend_from_slice(mono);
     out.extend(b"\r\nPRINT 1,1\r\n");
     out
+}
+
+fn mono_get(src: &[u8], width: u32, x: u32, y: u32) -> bool {
+    let width_bytes = width.div_ceil(8);
+    let idx = (y * width_bytes + x / 8) as usize;
+    if idx >= src.len() {
+        return false;
+    }
+    ((src[idx] >> (7 - (x % 8))) & 1) == 1
+}
+
+fn mono_set(dst: &mut [u8], width: u32, x: u32, y: u32) {
+    let width_bytes = width.div_ceil(8);
+    let idx = (y * width_bytes + x / 8) as usize;
+    if idx < dst.len() {
+        dst[idx] |= 0x80 >> (x % 8);
+    }
+}
+
+/// 描述: 1bit 位图旋转（0/90/180/270）
+fn rotate_mono(width: u32, height: u32, src: &[u8], degrees: u32) -> (u32, u32, Vec<u8>) {
+    let deg = degrees % 360;
+    if deg == 0 {
+        return (width, height, src.to_vec());
+    }
+    if deg == 180 {
+        let width_bytes = width.div_ceil(8);
+        let mut dst = vec![0u8; (width_bytes * height) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                if mono_get(src, width, x, y) {
+                    mono_set(&mut dst, width, width - 1 - x, height - 1 - y);
+                }
+            }
+        }
+        return (width, height, dst);
+    }
+    if deg == 90 || deg == 270 {
+        let (out_w, out_h) = (height, width);
+        let out_width_bytes = out_w.div_ceil(8);
+        let mut dst = vec![0u8; (out_width_bytes * out_h) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                if !mono_get(src, width, x, y) {
+                    continue;
+                }
+                let (nx, ny) = if deg == 90 {
+                    (height - 1 - y, x)
+                } else {
+                    (y, width - 1 - x)
+                };
+                mono_set(&mut dst, out_w, nx, ny);
+            }
+        }
+        return (out_w, out_h, dst);
+    }
+    (width, height, src.to_vec())
 }
 fn minimal_pdf(text: &str) -> Vec<u8> {
     let safe = text.replace('(', "[").replace(')', "]").replace('\n', " ");

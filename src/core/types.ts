@@ -309,6 +309,8 @@ export interface HPrintRasterCalibration {
   topCropMm?: number
   threshold?: number
   invertMono?: boolean
+  /** 位图旋转角度，标签机常见需要 180 */
+  rotateDegrees?: 0 | 90 | 180 | 270
 }
 
 export interface HPrintPrinterUsagePaper {
