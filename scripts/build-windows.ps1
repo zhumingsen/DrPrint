@@ -2,7 +2,13 @@
 # 用法: 在仓库 hiprint-v2 目录执行  powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
 
 $ErrorActionPreference = "Stop"
+if (-not $PSScriptRoot) {
+  $PSScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
 $Root = Split-Path -Parent $PSScriptRoot
+if (-not $Root) {
+  Write-Error "无法定位项目根目录"
+}
 Set-Location $Root
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
