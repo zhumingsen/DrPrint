@@ -180,6 +180,7 @@ pub async fn serve(state: AgentState, port: Arc<AtomicU16>) {
             "/print-history/:id",
             get(history_item).delete(delete_history_item),
         )
+        .route("/logs", get(logs))
         .route("/test-raw", post(test_raw))
         .route("/diagnostics", get(diagnostics))
         .route("/auth/config", get(auth_config))
@@ -599,6 +600,18 @@ async fn clear_history(
     Ok(Json(json!({ "ok": true })))
 }
 
+async fn logs(
+    State(state): State<AgentState>,
+    headers: HeaderMap,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<Value>, ApiResponse> {
+    authorize(&headers, &state)?;
+    let limit = query.limit.unwrap_or(100).min(500);
+    let jobs = state.jobs.read().await;
+    let items = jobs.values().take(limit).cloned().collect::<Vec<_>>();
+    Ok(Json(json!({ "logs": items, "count": jobs.len() })))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawRequest {
@@ -662,7 +675,7 @@ async fn diagnostics(
     let printers = printer::list_printers();
     let jobs = state.jobs.read().await;
     Ok(Json(
-        json!({ "agent": { "version": "1.0.0-reconstructed", "protocolVersion": "2026-06" }, "system": { "platform": std::env::consts::OS, "arch": std::env::consts::ARCH }, "printers": { "count": printers.len(), "defaultPrinter": printers.iter().find(|p| p.is_default).map(|p| p.name.clone()) }, "jobs": { "total": jobs.len(), "queued": jobs.values().filter(|j| j.status == "queued").count(), "printed": jobs.values().filter(|j| j.status == "printed").count(), "failed": jobs.values().filter(|j| j.status == "failed").count() }, "uptimeSeconds": state.started_at.elapsed().as_secs() }),
+        json!({ "agent": { "version": "1.0.0-reconstructed", "protocolVersion": "2026-06" }, "system": { "platform": std::env::consts::OS, "arch": std::env::consts::ARCH }, "printers": { "count": printers.len(), "defaultPrinter": printers.iter().find(|p| p.is_default).map(|p| p.name.clone()) }, "jobs": { "total": jobs.len(), "queued": jobs.values().filter(|j| j.status == "queued").count(), "printing": jobs.values().filter(|j| j.status == "printing").count(), "printed": jobs.values().filter(|j| j.status == "printed").count(), "failed": jobs.values().filter(|j| j.status == "failed").count() }, "uptimeSeconds": state.started_at.elapsed().as_secs() }),
     ))
 }
 async fn auth_config(
