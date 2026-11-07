@@ -452,6 +452,14 @@ pub fn print_mono_gdi(
             let page_h = GetDeviceCaps(hdc, VERTRES).max(1);
             let mut dest_w = ((width_mm.max(1.0) / 25.4) * dpi_x).round() as i32;
             let mut dest_h = ((height_mm.max(1.0) / 25.4) * dpi_y).round() as i32;
+            // 等比缩进页面，避免单边 clamp 压扁字形看起来像乱码
+            if dest_w > page_w || dest_h > page_h {
+                let scale = (page_w as f64 / dest_w as f64)
+                    .min(page_h as f64 / dest_h as f64)
+                    .min(1.0);
+                dest_w = ((dest_w as f64) * scale).round().max(1.0) as i32;
+                dest_h = ((dest_h as f64) * scale).round().max(1.0) as i32;
+            }
             dest_w = dest_w.clamp(1, page_w);
             dest_h = dest_h.clamp(1, page_h);
 

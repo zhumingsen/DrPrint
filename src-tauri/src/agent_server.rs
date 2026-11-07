@@ -487,22 +487,29 @@ async fn process_job(state: AgentState, id: String) {
                     Ok(rasters.clone())
                 } else {
                     // 兼容正式 SDK：只交 HTML，由 Agent 用 Edge 无头截图生成位图
-                    let (paper_w, paper_h, _) = paper_mm(&request.template, &usage_settings);
+                    let (paper_w, paper_h, _, orientation) =
+                        paper_geometry(&request.template, &usage_settings);
                     let threshold = usage_settings
                         .pointer("/rasterCalibration/threshold")
                         .and_then(Value::as_u64)
                         .unwrap_or(160)
                         .clamp(1, 255) as u8;
-                    let target_width_dots = usage_settings
-                        .get("printableWidthDots")
-                        .and_then(Value::as_u64)
-                        .map(|v| v as u32)
-                        .or_else(|| {
-                            usage_settings
-                                .get("printableWidthMm")
-                                .and_then(Value::as_f64)
-                                .map(|mm| ((mm * 203.0 / 25.4).round() as u32).max(8))
-                        });
+                    // 会旋 90° 的方向先按毫米渲；不旋转的方向对齐机芯可打点宽
+                    let will_rotate_for_orientation = orientation == "portrait";
+                    let target_width_dots = if will_rotate_for_orientation {
+                        None
+                    } else {
+                        usage_settings
+                            .get("printableWidthDots")
+                            .and_then(Value::as_u64)
+                            .map(|v| v as u32)
+                            .or_else(|| {
+                                usage_settings
+                                    .get("printableWidthMm")
+                                    .and_then(Value::as_f64)
+                                    .map(|mm| ((mm * 203.0 / 25.4).round() as u32).max(8))
+                            })
+                    };
                     match raster::html_to_mono_raster(
                         &html,
                         paper_w,
@@ -939,14 +946,14 @@ fn print_raw_copies(
     Ok(written)
 }
 
-/// 描述: 准备 GDI 打印页（裁白边/旋转；不反色，驱动按正常黑字输出）
+/// 描述: 准备 GDI 打印页（裁白边/按模板方向旋转；驱动按正常黑字输出）
 fn prepare_gdi_pages(
     rasters: &[RasterPage],
     template: &Value,
     usage_settings: &Value,
     usage: &str,
 ) -> Result<Vec<(u32, u32, Vec<u8>, f64, f64)>, (String, String)> {
-    let (paper_w, paper_h, _) = paper_mm(template, usage_settings);
+    let (paper_w, paper_h, _, orientation) = paper_geometry(template, usage_settings);
     let mut pages = Vec::with_capacity(rasters.len());
     for page in rasters {
         let mono = BASE64.decode(page.bytes_base64.as_bytes()).map_err(|e| {
@@ -972,29 +979,31 @@ fn prepare_gdi_pages(
             .pointer("/rasterCalibration/invertMono")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let default_rotate = if usage == "label" { 180 } else { 0 };
-        let rotate = usage_settings
-            .pointer("/rasterCalibration/rotateDegrees")
-            .and_then(Value::as_u64)
-            .unwrap_or(default_rotate) as u32;
+        let rotate = resolve_rotate_degrees(usage_settings, usage, &orientation);
         let (out_w, out_h, mut packed) = rotate_mono(page_w, page_h, &page_bits, rotate);
         if invert {
             for b in &mut packed {
                 *b = !*b;
             }
         }
+        // 物理纸宽：可打宽度优先，否则取模板短边（卷纸横向）
         let size_w = usage_settings
             .get("printableWidthMm")
             .and_then(Value::as_f64)
-            .unwrap_or(paper_w);
-        let size_h = ((out_h as f64) * 25.4 / 203.0).max(1.0).min(paper_h.max(1.0));
+            .unwrap_or_else(|| paper_w.min(paper_h).max(1.0));
+        // 按位图比例出高度，避免压扁造成“局部乱码”
+        let size_h = if out_w > 0 {
+            (size_w * out_h as f64 / out_w as f64).max(1.0)
+        } else {
+            ((out_h as f64) * 25.4 / 203.0).max(1.0)
+        };
         pages.push((out_w, out_h, packed, size_w, size_h));
     }
     Ok(pages)
 }
 
-fn paper_mm(template: &Value, usage_settings: &Value) -> (f64, f64, f64) {
-    // 与打印机设置里的 paperPolicy 对齐：template / configFallback 优先模板尺寸
+/// 描述: 读取纸张并按 orientation 纠正宽高（与前端 visualRenderer 一致）
+fn paper_geometry(template: &Value, usage_settings: &Value) -> (f64, f64, f64, String) {
     let policy = usage_settings
         .get("paperPolicy")
         .and_then(Value::as_str)
@@ -1007,19 +1016,46 @@ fn paper_mm(template: &Value, usage_settings: &Value) -> (f64, f64, f64) {
             .get("paper")
             .or_else(|| usage_settings.get("paper")),
     };
-    let width = paper
+    let raw_w = paper
         .and_then(|p| p.get("width"))
         .and_then(Value::as_f64)
         .unwrap_or(80.0);
-    let height = paper
+    let raw_h = paper
         .and_then(|p| p.get("height"))
         .and_then(Value::as_f64)
         .unwrap_or(60.0);
+    let orientation = paper
+        .and_then(|p| p.get("orientation"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if raw_w > raw_h {
+                "landscape".to_string()
+            } else {
+                "portrait".to_string()
+            }
+        });
+    // 与设计器画布一致：以模板里存的 width/height 为准，不再按 orientation 对调长短边
+    // （orientation 只影响出纸旋转角）
+    let width = raw_w;
+    let height = raw_h;
     let gap = usage_settings
         .get("gapMm")
         .and_then(Value::as_f64)
         .unwrap_or(2.0);
-    (width, height, gap)
+    (width, height, gap, orientation)
+}
+
+/// 描述: 旋转角 = 模板方向（横向不转、纵向旋 90° 适配卷纸）+ 校准角（标签默认 180°）
+fn resolve_rotate_degrees(usage_settings: &Value, usage: &str, orientation: &str) -> u32 {
+    // 与上一版对调：横向按模板宽高直接出；纵向再旋到卷纸方向
+    let from_orientation = if orientation == "portrait" { 90 } else { 0 };
+    let default_calib = if usage == "label" { 180 } else { 0 };
+    let from_calib = usage_settings
+        .pointer("/rasterCalibration/rotateDegrees")
+        .and_then(Value::as_u64)
+        .unwrap_or(default_calib) as u32;
+    (from_orientation + from_calib) % 360
 }
 
 fn build_raster_payload(
@@ -1029,7 +1065,7 @@ fn build_raster_payload(
     usage_settings: &Value,
     usage: &str,
 ) -> Result<Vec<u8>, (String, String)> {
-    let (paper_w, paper_h, gap) = paper_mm(template, usage_settings);
+    let (paper_w, paper_h, gap, orientation) = paper_geometry(template, usage_settings);
     let mut out = Vec::new();
     for page in rasters {
         let mono = BASE64.decode(page.bytes_base64.as_bytes()).map_err(|e| {
@@ -1057,12 +1093,7 @@ fn build_raster_payload(
             .pointer("/rasterCalibration/invertMono")
             .and_then(Value::as_bool)
             .unwrap_or(protocol == "tspl" || protocol == "cpcl");
-        // 标签默认旋转 180；小票默认不转（可在 rotateDegrees 覆盖）
-        let default_rotate = if usage == "label" { 180 } else { 0 };
-        let rotate = usage_settings
-            .pointer("/rasterCalibration/rotateDegrees")
-            .and_then(Value::as_u64)
-            .unwrap_or(default_rotate) as u32;
+        let rotate = resolve_rotate_degrees(usage_settings, usage, &orientation);
         let (out_w, out_h, mut packed) =
             rotate_mono(page_w, page_h, &page_bits, rotate);
         if invert {
@@ -1075,8 +1106,12 @@ fn build_raster_payload(
         let size_w = usage_settings
             .get("printableWidthMm")
             .and_then(Value::as_f64)
-            .unwrap_or(paper_w);
-        let size_h = ((out_h as f64) * 25.4 / 203.0).max(1.0).min(paper_h.max(1.0));
+            .unwrap_or_else(|| paper_w.min(paper_h).max(1.0));
+        let size_h = if out_w > 0 {
+            (size_w * out_h as f64 / out_w as f64).max(1.0)
+        } else {
+            ((out_h as f64) * 25.4 / 203.0).max(1.0)
+        };
         match protocol {
             "escpos" => {
                 out.extend_from_slice(b"\x1b\x40");
