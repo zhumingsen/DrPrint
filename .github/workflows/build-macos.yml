@@ -1,9 +1,10 @@
-# 描述：在 GitHub macos-latest 上打包 Mac DMG
 name: Build macOS DMG
 
 on:
   workflow_dispatch:
   push:
+    branches:
+      - master
     tags:
       - 'v*'
 
